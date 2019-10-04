@@ -49,14 +49,17 @@ enum connection_type {
 
 struct idevice_private {
 	char *udid;
+	uint32_t mux_id;
 	enum connection_type conn_type;
 	void *conn_data;
+	int version;
 };
 
 struct cb_data {
 	idevice_t dev;
 	np_client_t np;
 	int is_device_connected;
+	int is_finished;
 };
 
 static void lockdownd_set_untrusted_host_buid(lockdownd_client_t lockdown)
@@ -95,6 +98,7 @@ static void np_callback(const char* notification, void* userdata)
 		lerr = lockdownd_client_new(dev, &lockdown, "usbmuxd");
 		if (lerr != LOCKDOWN_E_SUCCESS) {
 			usbmuxd_log(LL_ERROR, "%s: ERROR: Could not connect to lockdownd on device %s, lockdown error %d", __func__, _dev->udid, lerr);
+			cbdata->is_finished = 1;
 			return;
 		}
 
@@ -102,10 +106,11 @@ static void np_callback(const char* notification, void* userdata)
 		if (lerr != LOCKDOWN_E_SUCCESS) {
 			usbmuxd_log(LL_ERROR, "%s: ERROR: Pair failed for device %s, lockdown error %d", __func__, _dev->udid, lerr);
 			lockdownd_client_free(lockdown);
+			cbdata->is_finished = 1;
 			return;
 		}
 		lockdownd_client_free(lockdown);
-		// device will reconnect by itself at this point.
+		cbdata->is_finished = 1;
 
 	} else if (strcmp(notification, "com.apple.mobile.lockdown.request_host_buid") == 0) {
 		lerr = lockdownd_client_new(cbdata->dev, &lockdown, "usbmuxd");
@@ -123,8 +128,10 @@ static void* preflight_worker_handle_device_add(void* userdata)
 	struct device_info *info = (struct device_info*)userdata;
 	struct idevice_private *_dev = (struct idevice_private*)malloc(sizeof(struct idevice_private));
 	_dev->udid = strdup(info->serial);
+	_dev->mux_id = info->id;
 	_dev->conn_type = CONNECTION_USBMUXD;
-	_dev->conn_data = (void*)(long)info->id;
+	_dev->conn_data = NULL;
+	_dev->version = 0;
 
 	idevice_t dev = (idevice_t)_dev;
 
@@ -232,7 +239,9 @@ retry:
 		lockdownd_service_descriptor_t service = NULL;
 		lerr = lockdownd_start_service(lockdown, "com.apple.mobile.insecure_notification_proxy", &service);
 		if (lerr != LOCKDOWN_E_SUCCESS) {
-			usbmuxd_log(LL_ERROR, "%s: ERROR: Could not start insecure_notification_proxy on %s, lockdown error %d", __func__, _dev->udid, lerr);
+			/* even though we failed, simple mode should still work, so only warn of an error */
+			usbmuxd_log(LL_INFO, "%s: ERROR: Could not start insecure_notification_proxy on %s, lockdown error %d", __func__, _dev->udid, lerr);
+			client_device_add(info);
 			goto leave;
 		}
 
@@ -249,6 +258,7 @@ retry:
 		cbdata.dev = dev;
 		cbdata.np = np;
 		cbdata.is_device_connected = 1;
+		cbdata.is_finished = 0;
 
 		np_set_notify_callback(np, np_callback, (void*)&cbdata);
 		device_set_preflight_cb_data(info->id, (void*)&cbdata);
@@ -267,7 +277,7 @@ retry:
 		/* make device visible anyways */
 		client_device_add(info);
 
-		while (cbdata.np && cbdata.is_device_connected == 1) {
+		while (cbdata.np && cbdata.is_device_connected && !cbdata.is_finished) {
 			sleep(1);
 		}
 		device_set_preflight_cb_data(info->id, NULL);

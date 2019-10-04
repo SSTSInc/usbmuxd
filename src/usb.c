@@ -53,7 +53,6 @@
 struct usb_device {
 	libusb_device_handle *dev;
 	uint8_t bus, address;
-	uint16_t vid, pid;
 	char serial[256];
 	int alive;
 	uint8_t interface, ep_in, ep_out;
@@ -61,6 +60,7 @@ struct usb_device {
 	struct collection tx_xfers;
 	int wMaxPacketSize;
 	uint64_t speed;
+	struct libusb_device_descriptor devdesc;
 };
 
 static struct collection device_list;
@@ -258,6 +258,103 @@ static int start_rx_loop(struct usb_device *dev)
 	return 0;
 }
 
+static void get_serial_callback(struct libusb_transfer *transfer)
+{
+	unsigned int di, si;
+	struct usb_device *usbdev = transfer->user_data;
+
+	if(transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+		usbmuxd_log(LL_ERROR, "Failed to request serial for device %d-%d (%i)", usbdev->bus, usbdev->address, transfer->status);
+		libusb_free_transfer(transfer);
+		return;
+	}
+
+	/* De-unicode, taken from libusb */
+	unsigned char *data = libusb_control_transfer_get_data(transfer);
+	for (di = 0, si = 2; si < data[0] && di < sizeof(usbdev->serial)-1; si += 2) {
+		if ((data[si] & 0x80) || (data[si + 1])) /* non-ASCII */
+			usbdev->serial[di++] = '?';
+		else if (data[si] == '\0')
+			break;
+		else
+			usbdev->serial[di++] = data[si];
+	}
+	usbdev->serial[di] = '\0';
+
+	usbmuxd_log(LL_INFO, "Got serial '%s' for device %d-%d", usbdev->serial, usbdev->bus, usbdev->address);
+
+	libusb_free_transfer(transfer);
+
+	/* new style UDID: add hyphen between first 8 and following 16 digits */
+	if (di == 24) {
+		memmove(&usbdev->serial[9], &usbdev->serial[8], 16);
+		usbdev->serial[8] = '-';
+		usbdev->serial[di+1] = '\0';
+	}
+
+	/* Finish setup now */
+	if(device_add(usbdev) < 0) {
+		usb_disconnect(usbdev);
+		return;
+	}
+
+	// Spin up NUM_RX_LOOPS parallel usb data retrieval loops
+	// Old usbmuxds used only 1 rx loop, but that leaves the
+	// USB port sleeping most of the time
+	int rx_loops = NUM_RX_LOOPS;
+	for (rx_loops = NUM_RX_LOOPS; rx_loops > 0; rx_loops--) {
+		if(start_rx_loop(usbdev) < 0) {
+			usbmuxd_log(LL_WARNING, "Failed to start RX loop number %d", NUM_RX_LOOPS - rx_loops);
+			break;
+		}
+	}
+
+	// Ensure we have at least 1 RX loop going
+	if (rx_loops == NUM_RX_LOOPS) {
+		usbmuxd_log(LL_FATAL, "Failed to start any RX loop for device %d-%d",
+					usbdev->bus, usbdev->address);
+		device_remove(usbdev);
+		usb_disconnect(usbdev);
+		return;
+	} else if (rx_loops > 0) {
+		usbmuxd_log(LL_WARNING, "Failed to start all %d RX loops. Going on with %d loops. "
+					"This may have negative impact on device read speed.",
+					NUM_RX_LOOPS, NUM_RX_LOOPS - rx_loops);
+	} else {
+		usbmuxd_log(LL_DEBUG, "All %d RX loops started successfully", NUM_RX_LOOPS);
+	}
+}
+
+static void get_langid_callback(struct libusb_transfer *transfer)
+{
+	int res;
+	struct usb_device *usbdev = transfer->user_data;
+
+	transfer->flags |= LIBUSB_TRANSFER_FREE_BUFFER;
+
+	if(transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+		 usbmuxd_log(LL_ERROR, "Failed to request lang ID for device %d-%d (%i)", usbdev->bus,
+				 usbdev->address, transfer->status);
+		 libusb_free_transfer(transfer);
+		 return;
+	}
+
+	unsigned char *data = libusb_control_transfer_get_data(transfer);
+	uint16_t langid = (uint16_t)(data[2] | (data[3] << 8));
+	usbmuxd_log(LL_INFO, "Got lang ID %u for device %d-%d", langid, usbdev->bus, usbdev->address);
+
+	/* re-use the same transfer */
+	libusb_fill_control_setup(transfer->buffer, LIBUSB_ENDPOINT_IN, LIBUSB_REQUEST_GET_DESCRIPTOR,
+			(uint16_t)((LIBUSB_DT_STRING << 8) | usbdev->devdesc.iSerialNumber),
+			langid, 1024 + LIBUSB_CONTROL_SETUP_SIZE);
+	libusb_fill_control_transfer(transfer, usbdev->dev, transfer->buffer, get_serial_callback, usbdev, 1000);
+
+	if((res = libusb_submit_transfer(transfer)) < 0) {
+		usbmuxd_log(LL_ERROR, "Could not request transfer for device %d-%d (%d)", usbdev->bus, usbdev->address, res);
+		libusb_free_transfer(transfer);
+	}
+}
+
 static int usb_device_add(libusb_device* dev)
 {
 	int j, res;
@@ -265,6 +362,7 @@ static int usb_device_add(libusb_device* dev)
 	uint8_t bus = libusb_get_bus_number(dev);
 	uint8_t address = libusb_get_device_address(dev);
 	struct libusb_device_descriptor devdesc;
+	struct libusb_transfer *transfer;
 	int found = 0;
 	FOREACH(struct usb_device *usbdev, &device_list) {
 		if(usbdev->bus == bus && usbdev->address == address) {
@@ -287,19 +385,24 @@ static int usb_device_add(libusb_device* dev)
 		return -1;
 	libusb_device_handle *handle;
 	usbmuxd_log(LL_INFO, "Found new device with v/p %04x:%04x at %d-%d", devdesc.idVendor, devdesc.idProduct, bus, address);
-	// potentially blocking operations follow; they will only run when new devices are detected, which is acceptable
+	// No blocking operation can follow: it may be run in the libusb hotplug callback and libusb will refuse any
+	// blocking call
 	if((res = libusb_open(dev, &handle)) != 0) {
 		usbmuxd_log(LL_WARNING, "Could not open device %d-%d: %d", bus, address, res);
 		return -1;
 	}
 
+	int desired_config = devdesc.bNumConfigurations;
+	if (desired_config > 4) {
+		desired_config = 4;
+	}
 	int current_config = 0;
 	if((res = libusb_get_configuration(handle, &current_config)) != 0) {
 		usbmuxd_log(LL_WARNING, "Could not get configuration for device %d-%d: %d", bus, address, res);
 		libusb_close(handle);
 		return -1;
 	}
-	if (current_config != devdesc.bNumConfigurations) {
+	if (current_config != desired_config) {
 		struct libusb_config_descriptor *config;
 		if((res = libusb_get_active_config_descriptor(dev, &config)) != 0) {
 			usbmuxd_log(LL_NOTICE, "Could not get old configuration descriptor for device %d-%d: %d", bus, address, res);
@@ -321,9 +424,9 @@ static int usb_device_add(libusb_device* dev)
 			libusb_free_config_descriptor(config);
 		}
 
-		usbmuxd_log(LL_INFO, "Setting configuration for device %d-%d, from %d to %d", bus, address, current_config, devdesc.bNumConfigurations);
-		if((res = libusb_set_configuration(handle, devdesc.bNumConfigurations)) != 0) {
-			usbmuxd_log(LL_WARNING, "Could not set configuration %d for device %d-%d: %d", devdesc.bNumConfigurations, bus, address, res);
+		usbmuxd_log(LL_INFO, "Setting configuration for device %d-%d, from %d to %d", bus, address, current_config, desired_config);
+		if((res = libusb_set_configuration(handle, desired_config)) != 0) {
+			usbmuxd_log(LL_WARNING, "Could not set configuration %d for device %d-%d: %d", desired_config, bus, address, res);
 			libusb_close(handle);
 			return -1;
 		}
@@ -386,18 +489,27 @@ static int usb_device_add(libusb_device* dev)
 		return -1;
 	}
 
-	if((res = libusb_get_string_descriptor_ascii(handle, devdesc.iSerialNumber, (uint8_t *)usbdev->serial, 256)) <= 0) {
-		usbmuxd_log(LL_WARNING, "Could not get serial number for device %d-%d: %d", bus, address, res);
-		libusb_release_interface(handle, usbdev->interface);
+	transfer = libusb_alloc_transfer(0);
+	if(!transfer) {
+		usbmuxd_log(LL_WARNING, "Failed to allocate transfer for device %d-%d: %d", bus, address, res);
 		libusb_close(handle);
 		free(usbdev);
 		return -1;
 	}
-	usbdev->serial[res] = 0;
+
+	unsigned char *transfer_buffer = malloc(1024 + LIBUSB_CONTROL_SETUP_SIZE + 8);
+	if (!transfer_buffer) {
+		usbmuxd_log(LL_WARNING, "Failed to allocate transfer buffer for device %d-%d: %d", bus, address, res);
+		libusb_close(handle);
+		free(usbdev);
+		return -1;
+	}
+	memset(transfer_buffer, '\0', 1024 + LIBUSB_CONTROL_SETUP_SIZE + 8);
+
+	usbdev->serial[0] = 0;
 	usbdev->bus = bus;
 	usbdev->address = address;
-	usbdev->vid = devdesc.idVendor;
-	usbdev->pid = devdesc.idProduct;
+	usbdev->devdesc = devdesc;
 	usbdev->speed = 480000000;
 	usbdev->dev = handle;
 	usbdev->alive = 1;
@@ -428,40 +540,28 @@ static int usb_device_add(libusb_device* dev)
 
 	usbmuxd_log(LL_INFO, "USB Speed is %g MBit/s for device %d-%d", (double)(usbdev->speed / 1000000.0), usbdev->bus, usbdev->address);
 
+	/**
+	 * From libusb:
+	 * 	Asking for the zero'th index is special - it returns a string
+	 * 	descriptor that contains all the language IDs supported by the
+	 * 	device.
+	 **/
+	libusb_fill_control_setup(transfer_buffer, LIBUSB_ENDPOINT_IN, LIBUSB_REQUEST_GET_DESCRIPTOR, LIBUSB_DT_STRING << 8, 0, 1024 + LIBUSB_CONTROL_SETUP_SIZE);
+	libusb_fill_control_transfer(transfer, handle, transfer_buffer, get_langid_callback, usbdev, 1000);
+
+	if((res = libusb_submit_transfer(transfer)) < 0) {
+		usbmuxd_log(LL_ERROR, "Could not request transfer for device %d-%d (%d)", usbdev->bus, usbdev->address, res);
+		libusb_free_transfer(transfer);
+		libusb_close(handle);
+		free(transfer_buffer);
+		free(usbdev);
+		return -1;
+	}
+
 	collection_init(&usbdev->tx_xfers);
 	collection_init(&usbdev->rx_xfers);
 
 	collection_add(&device_list, usbdev);
-
-	if(device_add(usbdev) < 0) {
-		usb_disconnect(usbdev);
-		return -1;
-	}
-
-	// Spin up NUM_RX_LOOPS parallel usb data retrieval loops
-	// Old usbmuxds used only 1 rx loop, but that leaves the
-	// USB port sleeping most of the time
-	int rx_loops = NUM_RX_LOOPS;
-	for (rx_loops = NUM_RX_LOOPS; rx_loops > 0; rx_loops--) {
-		if(start_rx_loop(usbdev) < 0) {
-			usbmuxd_log(LL_WARNING, "Failed to start RX loop number %d", NUM_RX_LOOPS - rx_loops);
-		}
-	}
-
-	// Ensure we have at least 1 RX loop going
-	if (rx_loops == NUM_RX_LOOPS) {
-		usbmuxd_log(LL_FATAL, "Failed to start any RX loop for device %d-%d",
-					usbdev->bus, usbdev->address);
-		device_remove(usbdev);
-		usb_disconnect(usbdev);
-		return -1;
-	} else if (rx_loops > 0) {
-		usbmuxd_log(LL_WARNING, "Failed to start all %d RX loops. Going on with %d loops. "
-					"This may have negative impact on device read speed.",
-					NUM_RX_LOOPS, NUM_RX_LOOPS - rx_loops);
-	} else {
-		usbmuxd_log(LL_DEBUG, "All %d RX loops started successfully", NUM_RX_LOOPS);
-	}
 
 	return 0;
 }
@@ -542,7 +642,7 @@ uint16_t usb_get_pid(struct usb_device *dev)
 	if(!dev->dev) {
 		return 0;
 	}
-	return dev->pid;
+	return dev->devdesc.idProduct;
 }
 
 uint64_t usb_get_speed(struct usb_device *dev)
